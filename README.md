@@ -12,7 +12,7 @@ An LLM inference engine written from scratch in PyTorch. It serves TinyLlama-1.1
 | M3 | Paged KV cache (block manager + paged attention) | ✅ done |
 | M4 | Continuous batching engine with preemption | ✅ done |
 | M5 | Streaming server (OpenAI-style SSE) | ✅ done |
-| M6 | int8 weight-only quantisation | ⬜ |
+| M6 | int8 weight-only quantisation | ✅ done |
 | M7 | Benchmarks vs Hugging Face on a T4 | ⬜ |
 | M8 | Stretch: Triton decode kernel, CUDA graphs or prefix caching | ⬜ |
 | M9 | README results and demo | ⬜ |
@@ -40,6 +40,26 @@ Our forward pass loads the real TinyLlama-1.1B-Chat safetensors and is compared 
 | Client disconnect mid-stream (CI) | request aborted, all KV blocks freed |
 | 32 concurrent streams (CI) | all complete; batched outputs equal the same request sent alone |
 | Multi-byte characters split across tokens (CI) | held back until complete, never emitted as U+FFFD |
+
+### int8 weights (M6)
+
+Weight memory, counted from the tensors the model holds (`bench/memory.py`):
+
+| Weights | Size | Reduction vs fp16 | Extra KV cache it frees |
+|---|---|---|---|
+| fp16 | 2.05 GiB | — | — |
+| int8, lm_head kept in fp16 | 1.15 GiB | 44.0% | 2,685 blocks = 42,960 tokens |
+| int8, every linear layer | 1.09 GiB | **47.0%** | 2,867 blocks = 45,872 tokens |
+
+Quality, WikiText-2 perplexity of our forward pass (`bench/perplexity.py`, 1,024-token windows):
+
+| Weights | Perplexity | Change |
+|---|---|---|
+| full precision (fp32) | 10.7034 | — |
+| int8, lm_head full precision | 10.7030 | -0.004% |
+| int8, every linear layer | 10.7038 | +0.004% |
+
+These perplexities use the first 8 windows (8,192 predicted tokens) on CPU, so treat them as a check, not the final figure; the full 341k-token split runs on the T4 in M7. As a sanity check that quantisation is applied, the all-int8 model's logits move by 0.06 on average (max 2.6) and its top-1 prediction differs on 5% of random-token positions; on natural text the effect on perplexity is small.
 
 ### Single-stream speed (development baseline, CPU)
 
@@ -104,16 +124,20 @@ tinyinfer/engine/engine.py      generate() reference path; add_request()/step() 
 tinyinfer/engine/sequence.py    request state, status and timestamps (M4)
 tinyinfer/engine/scheduler.py   admission, token budget, preemption by recompute (M4)
 tinyinfer/engine/runner.py      builds batched inputs, runs prefill and decode (M4)
+tinyinfer/quant/int8.py         int8 per-channel weight-only Linear, quantize_model (M6)
 tinyinfer/server/api.py         FastAPI app: /v1/completions (SSE), /health, /metrics (M5)
 tinyinfer/server/worker.py      engine thread; per-request asyncio queues; cancellation
 tinyinfer/server/tokenizer.py   HF tokenizer wrapper; incremental detokenisation
 scripts/single_stream.py        prefill latency and decode tokens/s
 scripts/batching_speedup.py     sequential vs batched throughput, same outputs
+bench/memory.py                 weight bytes fp16 vs int8, extra KV blocks
+bench/perplexity.py             WikiText-2 perplexity: full precision vs int8
 tests/test_model.py          shapes, causality, RoPE property, HF parity
 tests/test_generate.py       cached == uncached decoding, sampling, HF generate() parity
 tests/test_paged.py          paged == contiguous, batched padding, no block leaks
 tests/test_batching.py       staggered arrivals, forced preemption, token budget, HF parity
 tests/test_server.py         real uvicorn server: SSE, stop strings, disconnects, 32 streams
+tests/test_quant.py          rounding bound, per-channel scales, exact byte savings
 tests/fixtures/              reference.pt and the script that builds it
 scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 ```
@@ -130,7 +154,8 @@ scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 8. **Prefill per sequence, decode batched.** Prompts of different lengths are prefilled one call each; all running sequences then decode one token together in a single forward pass. Merging prefill and decode into one call (chunked prefill) is a later optimisation.
 9. **One engine thread, async HTTP.** The engine is not thread-safe, so a single background thread owns it and loops `step()`. HTTP handlers send commands (add, abort) through a queue and receive tokens on per-request `asyncio.Queue`s via `call_soon_threadsafe`. The event loop never runs model code, so it stays responsive under load.
 10. **Detokenise the whole output, emit the suffix.** Decoding token by token breaks multi-byte characters and drops SentencePiece word-start spaces. The detokeniser decodes the output (with a few prompt tokens as context) each time and emits only new text, holding back incomplete characters and anything that could still become a stop string.
-11. **The loader is strict.** Every checkpoint tensor must map to exactly one parameter with the same shape, and every parameter must be filled, so a renamed weight fails loudly instead of loading half a model.
+11. **int8 weight-only, per output channel, dequantised on the fly.** Each output row gets its own scale (max |w| / 127), so rows with small weights keep their precision. The forward pass converts int8 weights back to the activation dtype and runs a normal matmul. This saves memory and memory bandwidth, not FLOPs; decode is limited by reading weights, so fewer bytes is what matters. A fused int8 kernel would also skip the temporary float copy.
+12. **The loader is strict.** Every checkpoint tensor must map to exactly one parameter with the same shape, and every parameter must be filled, so a renamed weight fails loudly instead of loading half a model.
 
 ## How it works
 

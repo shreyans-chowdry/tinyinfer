@@ -1,0 +1,10 @@
+{
+  "device": "cpu",
+  "dtype": "fp32",
+  "window": 1024,
+  "dataset_tokens": 341469,
+  "note": "--max-windows 8 (8,192 predicted tokens) on CPU; full split to be run on a T4",
+  "full": {"perplexity": 10.7034, "tokens": 8192, "seconds": 140.2},
+  "int8": {"perplexity": 10.703, "tokens": 8192, "seconds": 134.9, "increase_pct": -0.0, "within_2pct_budget": true},
+  "int8_all": {"perplexity": 10.7038, "tokens": 8192, "seconds": 132.7, "increase_pct": 0.0, "within_2pct_budget": true}
+}
