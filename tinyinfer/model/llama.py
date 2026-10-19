@@ -77,17 +77,33 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+        cache=None,
+        layer: int = 0,
+    ) -> torch.Tensor:
         b, t, _ = x.shape
         q = self.q_proj(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(b, t, self.n_kv, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(b, t, self.n_kv, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if cache is None:
+            key_pos = positions
+        else:
+            # Write this step's keys/values, then attend over everything stored.
+            k, v = cache.update(layer, k, v, positions)
+            key_pos = torch.arange(k.shape[2], device=x.device).unsqueeze(0).expand(b, -1)
         # GQA: query head h reads KV head h // groups. repeat_interleave on the
         # head axis produces exactly that mapping.
         k = k.repeat_interleave(self.groups, dim=1)
         v = v.repeat_interleave(self.groups, dim=1)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Causal mask from explicit positions: a query sees keys at or before it.
+        mask = key_pos.unsqueeze(1) <= positions.unsqueeze(2)  # [B, T, S]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1))
         return self.o_proj(out.transpose(1, 2).reshape(b, t, -1))
 
 
@@ -114,8 +130,8 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+    def forward(self, x, cos, sin, positions, cache=None, layer: int = 0) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, positions, cache, layer)
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -134,18 +150,19 @@ class Llama(nn.Module):
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_position_embeddings, cfg.rope_theta)
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor | None = None
+        self, input_ids: torch.Tensor, positions: torch.Tensor | None = None, cache=None
     ) -> torch.Tensor:
         """Return logits [B, T, vocab] for input_ids [B, T].
 
         positions defaults to 0..T-1; pass it explicitly when tokens do not
-        start at position 0.
+        start at position 0. With a cache, keys/values are written at those
+        positions and attention covers everything stored so far.
         """
         if positions is None:
             positions = torch.arange(input_ids.shape[1], device=input_ids.device)
             positions = positions.unsqueeze(0).expand(input_ids.shape[0], -1)
         cos, sin = self.rope(positions)
         x = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, positions, cache, i)
         return self.lm_head(self.norm(x))

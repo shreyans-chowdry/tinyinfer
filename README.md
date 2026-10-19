@@ -8,7 +8,7 @@ An LLM inference engine written from scratch in PyTorch. It serves TinyLlama-1.1
 |---|---|---|
 | M0 | Setup, CI, tiny test config, Hugging Face reference fixtures | ✅ done |
 | M1 | Llama forward pass from scratch (RMSNorm, RoPE, GQA, SwiGLU) | ✅ done |
-| M2 | KV cache, sampling, single-request `generate()` | ⬜ |
+| M2 | KV cache, sampling, single-request `generate()` | ✅ done |
 | M3 | Paged KV cache (block manager + paged attention) | ⬜ |
 | M4 | Continuous batching engine with preemption | ⬜ |
 | M5 | Streaming server (OpenAI-style SSE) | ⬜ |
@@ -27,6 +27,16 @@ Our forward pass loads the real TinyLlama-1.1B-Chat safetensors and is compared 
 | Argmax token vs Hugging Face | identical on all 5 prompts |
 | Random tiny model vs Hugging Face (CI) | max abs difference < 1e-4 |
 | Sensitivity check | scaling one MLP weight by 1% moves logits by 0.016, so the test detects real differences |
+| KV-cache greedy decoding vs Hugging Face `generate()` | identical tokens on all 5 prompts (up to 32 new tokens) |
+| Cached vs uncached decoding (tiny model, CI) | identical for 64 greedy tokens and for seeded top-k/top-p sampling |
+
+### Single-stream speed (development baseline, CPU)
+
+From `scripts/single_stream.py`, median of 3 runs after warm-up. The headline GPU numbers come from the T4 benchmark in M7.
+
+| Hardware | dtype | Prefill 128 tok | Prefill 512 tok | Decode |
+|---|---|---|---|---|
+| Intel Xeon 2.8 GHz, 2 vCPU | fp32 | 2,339 ms | 8,090 ms | 2.81 tok/s |
 
 ## How to run
 
@@ -52,7 +62,12 @@ python tests/fixtures/make_reference.py --model-dir ~/.cache/tinyllama --device 
 tinyinfer/model/config.py    LlamaConfig, tiny_config() for tests
 tinyinfer/model/llama.py     RMSNorm, RoPE, GQA attention, SwiGLU MLP, decoder
 tinyinfer/model/loader.py    safetensors -> our modules, with name and shape checks
+tinyinfer/cache/contiguous.py   preallocated per-layer KV cache (M2)
+tinyinfer/engine/sampling.py    greedy, temperature, top-k, top-p, stop tokens
+tinyinfer/engine/engine.py      LLMEngine.generate(): prefill + decode loop
+scripts/single_stream.py        prefill latency and decode tokens/s
 tests/test_model.py          shapes, causality, RoPE property, HF parity
+tests/test_generate.py       cached == uncached decoding, sampling, HF generate() parity
 tests/fixtures/              reference.pt and the script that builds it
 scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 ```
@@ -62,7 +77,9 @@ scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 1. **Positions are always explicit.** The forward pass takes `positions` instead of inferring them from tensor shape, because a KV cache, padding and preemption all run tokens at positions that do not start at 0.
 2. **GQA by `repeat_interleave` on the head axis.** Query head *h* reads KV head *h // groups*. This matches Hugging Face's `repeat_kv`; a wrong mapping still produces fluent text, which is why the parity test compares logits rather than generated text.
 3. **RMSNorm in fp32.** Normalisation is computed in fp32 and cast back, matching the reference and avoiding fp16 overflow.
-4. **The loader is strict.** Every checkpoint tensor must map to exactly one parameter with the same shape, and every parameter must be filled, so a renamed weight fails loudly instead of loading half a model.
+4. **Masks come from positions, not shapes.** Attention builds its causal mask by comparing query and key positions. The same code then handles a full prompt, one decode step against the cache, and (later) sequences at different lengths in one batch.
+5. **Prefill and decode are separate calls.** Prefill runs the whole prompt in one compute-bound pass; decode runs one token per step and is limited by reading weights from memory, which is why batching (M4) and int8 weights (M6) help it.
+6. **The loader is strict.** Every checkpoint tensor must map to exactly one parameter with the same shape, and every parameter must be filled, so a renamed weight fails loudly instead of loading half a model.
 
 ## How it works
 

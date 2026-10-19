@@ -1,0 +1,1 @@
+{"device": "Intel Xeon @ 2.80GHz (2 vCPU)", "dtype": "torch.float32", "torch": "2.14.1+cpu", "threads": 2, "prefill_128_ms": 2339.1, "prefill_512_ms": 8089.6, "decode_tokens_per_s": 2.81}
