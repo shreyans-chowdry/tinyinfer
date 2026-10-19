@@ -25,6 +25,7 @@ include = ["tinyinfer*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
   "gpu: needs a CUDA GPU (run on Kaggle/Colab T4)",
   "real: needs the real TinyLlama weights (TINYINFER_MODEL_DIR)",
