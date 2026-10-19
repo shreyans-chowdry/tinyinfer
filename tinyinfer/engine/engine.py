@@ -20,7 +20,7 @@ from tinyinfer.cache.paged import PagedKVCache
 from tinyinfer.engine.runner import ModelRunner
 from tinyinfer.engine.sampling import SamplingParams, sample
 from tinyinfer.engine.scheduler import Scheduler
-from tinyinfer.engine.sequence import Sequence
+from tinyinfer.engine.sequence import Sequence, Status
 from tinyinfer.model.llama import Llama
 
 
@@ -77,6 +77,18 @@ class LLMEngine:
 
     def has_unfinished(self) -> bool:
         return self.paged and self.scheduler.has_unfinished()
+
+    def abort(self, seq_id: int) -> bool:
+        """Cancel a request (e.g. client disconnected) and free its blocks at once."""
+        seq = self.sequences.get(seq_id)
+        if seq is None or seq.status is Status.FINISHED:
+            return False
+        if seq.status is Status.WAITING:
+            self.scheduler.waiting.remove(seq)
+            seq.finish("abort")
+        else:
+            self.scheduler.finish(seq, "abort")
+        return True
 
     def _accept(self, seq: Sequence, logits: torch.Tensor, events: list) -> None:
         token = sample(logits, seq.params, seq.generator)

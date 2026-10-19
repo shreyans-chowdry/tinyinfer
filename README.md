@@ -11,7 +11,7 @@ An LLM inference engine written from scratch in PyTorch. It serves TinyLlama-1.1
 | M2 | KV cache, sampling, single-request `generate()` | ✅ done |
 | M3 | Paged KV cache (block manager + paged attention) | ✅ done |
 | M4 | Continuous batching engine with preemption | ✅ done |
-| M5 | Streaming server (OpenAI-style SSE) | ⬜ |
+| M5 | Streaming server (OpenAI-style SSE) | ✅ done |
 | M6 | int8 weight-only quantisation | ⬜ |
 | M7 | Benchmarks vs Hugging Face on a T4 | ⬜ |
 | M8 | Stretch: Triton decode kernel, CUDA graphs or prefix caching | ⬜ |
@@ -36,6 +36,10 @@ Our forward pass loads the real TinyLlama-1.1B-Chat safetensors and is compared 
 | Continuous batching vs Hugging Face `generate()` | all 5 prompts decoded together in one batch give identical tokens |
 | 20 requests arriving at random steps (CI) | identical outputs to running each alone; all blocks freed |
 | Forced preemption (CI) | 26 blocks of 4 tokens for 12 requests: 8 preemptions, outputs still identical |
+| Streaming vs non-streaming API (CI) | concatenated SSE chunks equal the non-streamed text; stream ends with `[DONE]` |
+| Client disconnect mid-stream (CI) | request aborted, all KV blocks freed |
+| 32 concurrent streams (CI) | all complete; batched outputs equal the same request sent alone |
+| Multi-byte characters split across tokens (CI) | held back until complete, never emitted as U+FFFD |
 
 ### Single-stream speed (development baseline, CPU)
 
@@ -59,6 +63,27 @@ python scripts/download.py --out ~/.cache/tinyllama
 TINYINFER_MODEL_DIR=~/.cache/tinyllama pytest -q -m real -s   # real weights vs fixture
 ```
 
+Serve the model (OpenAI-style completions API):
+
+```bash
+pip install -e ".[server]"
+python -m tinyinfer.server.api --model-dir ~/.cache/tinyllama --port 8000
+curl -N localhost:8000/v1/completions -H 'content-type: application/json' \
+     -d '{"prompt": "The capital of France is", "max_tokens": 8, "temperature": 0, "stream": true}'
+```
+
+Real output from TinyLlama (chunks abbreviated):
+
+```
+data: {"object": "text_completion", "model": "tinyllama", "choices": [{"text": " Paris", "finish_reason": null}]}
+data: {... "choices": [{"text": ".", "finish_reason": null}]}
+...
+data: {... "choices": [{"text": "", "finish_reason": "length"}]}
+data: [DONE]
+```
+
+Endpoints: `POST /v1/completions` (`prompt`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `seed`, `stream`), `GET /health`, `GET /metrics` (running, waiting, free blocks, preemptions, tokens/s over the last 10 s).
+
 To rebuild the reference fixture (needs about 5 GB RAM in fp32):
 
 ```bash
@@ -79,12 +104,16 @@ tinyinfer/engine/engine.py      generate() reference path; add_request()/step() 
 tinyinfer/engine/sequence.py    request state, status and timestamps (M4)
 tinyinfer/engine/scheduler.py   admission, token budget, preemption by recompute (M4)
 tinyinfer/engine/runner.py      builds batched inputs, runs prefill and decode (M4)
+tinyinfer/server/api.py         FastAPI app: /v1/completions (SSE), /health, /metrics (M5)
+tinyinfer/server/worker.py      engine thread; per-request asyncio queues; cancellation
+tinyinfer/server/tokenizer.py   HF tokenizer wrapper; incremental detokenisation
 scripts/single_stream.py        prefill latency and decode tokens/s
 scripts/batching_speedup.py     sequential vs batched throughput, same outputs
 tests/test_model.py          shapes, causality, RoPE property, HF parity
 tests/test_generate.py       cached == uncached decoding, sampling, HF generate() parity
 tests/test_paged.py          paged == contiguous, batched padding, no block leaks
 tests/test_batching.py       staggered arrivals, forced preemption, token budget, HF parity
+tests/test_server.py         real uvicorn server: SSE, stop strings, disconnects, 32 streams
 tests/fixtures/              reference.pt and the script that builds it
 scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 ```
@@ -99,7 +128,9 @@ scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 6. **Paged KV cache with 16-token blocks.** Reserving KV memory for every request's maximum length wastes most of it. Blocks are handed out on demand, so a sequence wastes less than one block. In TinyLlama fp16 one block holds 16 tokens across all 22 layers in 360,448 bytes. The first version gathers a sequence's blocks into a contiguous view before attention: simple and correct, at the cost of a copy that a custom kernel can remove later.
 7. **Iteration-level scheduling with preemption by recompute.** Each step, finished sequences leave and waiting ones join, limited by free blocks and a per-step token budget (default 2,048). When blocks run out, the newest sequences are preempted: their blocks are freed and they are recomputed from their tokens later. The alternative, swapping blocks to CPU memory, keeps the work but adds copies and complexity; recompute is simpler and correct. Nothing new is admitted in a step that preempted, to avoid thrashing.
 8. **Prefill per sequence, decode batched.** Prompts of different lengths are prefilled one call each; all running sequences then decode one token together in a single forward pass. Merging prefill and decode into one call (chunked prefill) is a later optimisation.
-9. **The loader is strict.** Every checkpoint tensor must map to exactly one parameter with the same shape, and every parameter must be filled, so a renamed weight fails loudly instead of loading half a model.
+9. **One engine thread, async HTTP.** The engine is not thread-safe, so a single background thread owns it and loops `step()`. HTTP handlers send commands (add, abort) through a queue and receive tokens on per-request `asyncio.Queue`s via `call_soon_threadsafe`. The event loop never runs model code, so it stays responsive under load.
+10. **Detokenise the whole output, emit the suffix.** Decoding token by token breaks multi-byte characters and drops SentencePiece word-start spaces. The detokeniser decodes the output (with a few prompt tokens as context) each time and emits only new text, holding back incomplete characters and anything that could still become a stop string.
+11. **The loader is strict.** Every checkpoint tensor must map to exactly one parameter with the same shape, and every parameter must be filled, so a renamed weight fails loudly instead of loading half a model.
 
 ## How it works
 

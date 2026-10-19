@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn"]
-dev = ["pytest", "ruff", "httpx", "transformers"]
+dev = ["pytest", "ruff", "httpx", "transformers", "fastapi", "uvicorn"]
 bench = ["transformers", "datasets", "httpx", "matplotlib"]
 
 [tool.setuptools.packages.find]
