@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyinfer"
+version = "0.1.0"
+description = "An LLM inference engine written from scratch: KV cache, paged attention, continuous batching, int8 weights, streaming API."
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "safetensors",
+  "huggingface_hub",
+  "tokenizers",
+  "numpy",
+]
+
+[project.optional-dependencies]
+server = ["fastapi", "uvicorn"]
+dev = ["pytest", "ruff", "httpx", "transformers"]
+bench = ["transformers", "datasets", "httpx", "matplotlib"]
+
+[tool.setuptools.packages.find]
+include = ["tinyinfer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "gpu: needs a CUDA GPU (run on Kaggle/Colab T4)",
+  "real: needs the real TinyLlama weights (TINYINFER_MODEL_DIR)",
+]
+addopts = "-m 'not gpu and not real'"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
