@@ -39,7 +39,8 @@ def main() -> None:
 
     dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
     tok = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=dtype).to(args.device).eval()
+    model = AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=dtype)
+    model = model.to(args.device).eval()
 
     cases = []
     for prompt in PROMPTS:

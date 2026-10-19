@@ -90,8 +90,11 @@ class LLMEngine:
             self.scheduler.finish(seq, "abort")
         return True
 
-    def _accept(self, seq: Sequence, logits: torch.Tensor, events: list) -> None:
-        token = sample(logits, seq.params, seq.generator)
+    def _accept(
+        self, seq: Sequence, logits: torch.Tensor | None, events: list, token: int | None = None
+    ) -> None:
+        if token is None:
+            token = sample(logits, seq.params, seq.generator)
         if token in set(seq.params.stop_token_ids) | {self.eos}:
             self.scheduler.finish(seq, "stop")
             events.append(StepEvent(seq.seq_id, None, True))
@@ -110,8 +113,13 @@ class LLMEngine:
             self._accept(seq, self.runner.prefill(seq), events)
         if plan.decodes:
             logits = self.runner.decode(plan.decodes)
+            # Greedy rows: one argmax and one device-to-host copy for the whole batch.
+            greedy = logits.argmax(-1).tolist()
             for row, seq in enumerate(plan.decodes):
-                self._accept(seq, logits[row], events)
+                if seq.params.temperature == 0:
+                    self._accept(seq, None, events, token=greedy[row])
+                else:
+                    self._accept(seq, logits[row], events)
         return events
 
     def generate_many(

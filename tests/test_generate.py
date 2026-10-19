@@ -12,6 +12,10 @@ from tinyinfer.engine.sampling import SamplingParams, filter_logits, sample
 from tinyinfer.model.config import tiny_config
 from tinyinfer.model.llama import Llama
 
+FIXTURE = Path(
+    os.environ.get("TINYINFER_FIXTURE", Path(__file__).parent / "fixtures" / "reference.pt")
+)
+
 
 @pytest.fixture(scope="module")
 def engine():
@@ -96,7 +100,7 @@ def test_tinyllama_greedy_matches_hugging_face_fixture():
     """Cached greedy decoding reproduces HF generate() tokens on the real model."""
     from tinyinfer.model.loader import load_model
 
-    fixture = Path(__file__).parent / "fixtures" / "reference.pt"
+    fixture = FIXTURE
     model_dir = os.environ.get("TINYINFER_MODEL_DIR")
     if not fixture.exists() or not model_dir:
         pytest.skip("set TINYINFER_MODEL_DIR and build tests/fixtures/reference.pt")

@@ -13,7 +13,7 @@ An LLM inference engine written from scratch in PyTorch. It serves TinyLlama-1.1
 | M4 | Continuous batching engine with preemption | ✅ done |
 | M5 | Streaming server (OpenAI-style SSE) | ✅ done |
 | M6 | int8 weight-only quantisation | ✅ done |
-| M7 | Benchmarks vs Hugging Face on a T4 | ⬜ |
+| M7 | Benchmarks vs Hugging Face on a T4 | 🟡 harness built and tested; T4 run pending |
 | M8 | Stretch: Triton decode kernel, CUDA graphs or prefix caching | ⬜ |
 | M9 | README results and demo | ⬜ |
 
@@ -70,6 +70,20 @@ From `scripts/single_stream.py`, median of 3 runs after warm-up. The headline GP
 | Intel Xeon 2.8 GHz, 2 vCPU | fp32 | 2,339 ms | 8,090 ms | 2.81 tok/s |
 
 Continuous batching on the same CPU (`scripts/batching_speedup.py`, 8 requests, 64-token prompts, 32 new tokens each): **2.31x** the throughput of running them one at a time (5.63 vs 2.43 tok/s), with identical outputs. On a GPU the gap is larger, because decoding one sequence leaves most of the GPU idle.
+
+## Benchmark protocol (M7)
+
+`bench/run_all.sh` (or `notebooks/kaggle_runner.ipynb` on a free Kaggle T4) runs everything and writes to `bench/results/`:
+
+| Step | Script | Output |
+|---|---|---|
+| GPU correctness vs HF fp16 on the same GPU | `pytest -m "real or gpu"` | `gpu_tests.txt` |
+| Single-request prefill latency and decode speed | `scripts/single_stream.py` | `single_stream_gpu.jsonl` |
+| Weight memory fp16 vs int8 | `bench/memory.py` | `memory_gpu.json` |
+| Full WikiText-2 perplexity, fp16 vs int8 | `bench/perplexity.py` | `perplexity_gpu.json` |
+| Throughput and latency vs Hugging Face | `bench/throughput.py` + `bench/report.py` | `summary.md`, `throughput.png`, `ttft_p99.png` |
+
+Throughput setup: random-token prompts of 64-512 tokens, each generating 64-256 tokens (seed 0); EOS ignored by every system so all do the same useful work. Concurrency 1, 4, 16, 32; 4 x concurrency requests per level (min 16); one warm-up plus 3 measured repeats, median reported. Systems: TinyInfer fp16 and int8 (closed loop: a finished request is replaced at once), Hugging Face `generate()` with static batches of the same size (left-padded; a batch runs until its longest request finishes), and Hugging Face one request at a time. The headline ratio is TinyInfer fp16 vs Hugging Face static batching at concurrency 16.
 
 ## How to run
 
@@ -132,12 +146,17 @@ scripts/single_stream.py        prefill latency and decode tokens/s
 scripts/batching_speedup.py     sequential vs batched throughput, same outputs
 bench/memory.py                 weight bytes fp16 vs int8, extra KV blocks
 bench/perplexity.py             WikiText-2 perplexity: full precision vs int8
+bench/throughput.py             TinyInfer vs HF static/sequential: tok/s, TTFT, TPOT (M7)
+bench/report.py                 summary.md + plots from raw results
+bench/run_all.sh                the whole protocol on a GPU
+notebooks/kaggle_runner.ipynb   clone, test and benchmark on a Kaggle T4
 tests/test_model.py          shapes, causality, RoPE property, HF parity
 tests/test_generate.py       cached == uncached decoding, sampling, HF generate() parity
 tests/test_paged.py          paged == contiguous, batched padding, no block leaks
 tests/test_batching.py       staggered arrivals, forced preemption, token budget, HF parity
 tests/test_server.py         real uvicorn server: SSE, stop strings, disconnects, 32 streams
 tests/test_quant.py          rounding bound, per-channel scales, exact byte savings
+tests/test_bench.py          benchmark harness end to end on tiny models
 tests/fixtures/              reference.pt and the script that builds it
 scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 ```
@@ -149,7 +168,7 @@ scripts/download.py          fetch TinyLlama from the Hugging Face Hub
 3. **RMSNorm in fp32.** Normalisation is computed in fp32 and cast back, matching the reference and avoiding fp16 overflow.
 4. **Masks come from positions, not shapes.** Attention builds its causal mask by comparing query and key positions. The same code then handles a full prompt, one decode step against the cache, and (later) sequences at different lengths in one batch.
 5. **Prefill and decode are separate calls.** Prefill runs the whole prompt in one compute-bound pass; decode runs one token per step and is limited by reading weights from memory, which is why batching (M4) and int8 weights (M6) help it.
-6. **Paged KV cache with 16-token blocks.** Reserving KV memory for every request's maximum length wastes most of it. Blocks are handed out on demand, so a sequence wastes less than one block. In TinyLlama fp16 one block holds 16 tokens across all 22 layers in 360,448 bytes. The first version gathers a sequence's blocks into a contiguous view before attention: simple and correct, at the cost of a copy that a custom kernel can remove later.
+6. **Paged KV cache with 16-token blocks.** Reserving KV memory for every request's maximum length wastes most of it. Blocks are handed out on demand, so a sequence wastes less than one block. In TinyLlama fp16 one block holds 16 tokens across all 22 layers in 360,448 bytes. Attention reads through a padded block table built once per forward pass: each layer does one vectorised write of the new keys/values and one gather of the whole batch's blocks. (The first version looped over sequences in Python; at 32 concurrent requests that meant ~700 small operations per step, so it was vectorised before the GPU benchmark, with every equivalence test unchanged.) The gather still copies blocks; a custom kernel could read them in place.
 7. **Iteration-level scheduling with preemption by recompute.** Each step, finished sequences leave and waiting ones join, limited by free blocks and a per-step token budget (default 2,048). When blocks run out, the newest sequences are preempted: their blocks are freed and they are recomputed from their tokens later. The alternative, swapping blocks to CPU memory, keeps the work but adds copies and complexity; recompute is simpler and correct. Nothing new is admitted in a step that preempted, to avoid thrashing.
 8. **Prefill per sequence, decode batched.** Prompts of different lengths are prefilled one call each; all running sequences then decode one token together in a single forward pass. Merging prefill and decode into one call (chunked prefill) is a later optimisation.
 9. **One engine thread, async HTTP.** The engine is not thread-safe, so a single background thread owns it and loops `step()`. HTTP handlers send commands (add, abort) through a queue and receive tokens on per-request `asyncio.Queue`s via `call_soon_threadsafe`. The event loop never runs model code, so it stays responsive under load.

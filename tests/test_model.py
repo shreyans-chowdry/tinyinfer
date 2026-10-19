@@ -5,12 +5,19 @@ safetensors, loads it with our loader and compares logits. It runs on CPU in
 seconds; the real TinyLlama fixture comparison is marked gpu.
 """
 
+import os
+from pathlib import Path
+
 import pytest
 import torch
 
 from tinyinfer.model.config import tiny_config
 from tinyinfer.model.llama import Llama, RotaryEmbedding, apply_rope
 from tinyinfer.model.loader import load_model
+
+FIXTURE = Path(
+    os.environ.get("TINYINFER_FIXTURE", Path(__file__).parent / "fixtures" / "reference.pt")
+)
 
 torch.manual_seed(0)
 
@@ -113,9 +120,7 @@ def test_tinyllama_matches_reference_fixture():
     Set TINYINFER_MODEL_DIR to the downloaded model. Runs in fp32 on CPU
     (tolerance 1e-3) or fp16 on CUDA (tolerance 2e-2).
     """
-    import os
-    from pathlib import Path
-    fixture = Path(__file__).parent / "fixtures" / "reference.pt"
+    fixture = FIXTURE
     model_dir = os.environ.get("TINYINFER_MODEL_DIR")
     if not fixture.exists() or not model_dir:
         pytest.skip("set TINYINFER_MODEL_DIR and build tests/fixtures/reference.pt")

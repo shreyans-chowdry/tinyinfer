@@ -1,13 +1,15 @@
 """Paged KV storage and attention reads through block tables (milestone M3).
 
-One pre-allocated tensor per layer, shaped [num_blocks, 2, kv_heads, block_size,
-head_dim] (index 0 = keys, 1 = values). Before a forward pass the engine
-reserves slots in the BlockManager and binds the batch's sequence ids; update()
-then writes each row's new K/V into its slots and gathers that row's blocks
-into a contiguous view for attention.
+One pre-allocated tensor per layer, shaped [num_blocks, block_size, 2,
+kv_heads, head_dim] (index 0 of the third axis = keys, 1 = values), so a token
+slot is one row of a [num_blocks * block_size, 2, kv_heads, head_dim] view.
+Before a forward pass the engine reserves slots in the BlockManager and binds
+the batch's sequence ids. At the first layer the cache builds a padded block
+table [B, max_blocks] and the key positions once; every layer then does one
+vectorised write and one gather for the whole batch.
 
-The gather copies blocks, which costs memory bandwidth; M8 can replace it with
-a kernel that reads blocks in place. Correctness first.
+The gather copies blocks, which costs memory bandwidth; a kernel that reads
+blocks in place (M8) would avoid the copy. Correctness first.
 """
 
 from __future__ import annotations
@@ -50,19 +52,31 @@ class PagedKVCache:
         self.cfg = cfg
         self.block_size = block_size
         self.blocks = BlockManager(num_blocks, block_size)
-        shape = (num_blocks, 2, cfg.num_key_value_heads, block_size, cfg.head_dim)
+        shape = (num_blocks, block_size, 2, cfg.num_key_value_heads, cfg.head_dim)
         self.kv = [
             torch.zeros(shape, device=device, dtype=dtype) for _ in range(cfg.num_hidden_layers)
         ]
         self.device = torch.device(device)
         self.seq_ids: list[int] = []
+        self._tables: torch.Tensor | None = None
+        self._key_pos: torch.Tensor | None = None
 
     def bind(self, seq_ids: list[int]) -> None:
         """Set which sequence each batch row belongs to for the next forward pass."""
         self.seq_ids = list(seq_ids)
 
-    def _table(self, seq_id: int) -> torch.Tensor:
-        return torch.tensor(self.blocks.tables[seq_id], device=self.device)
+    def _prepare(self) -> None:
+        """Build the padded block table and key positions for the bound batch."""
+        lens = [self.blocks.lens[s] for s in self.seq_ids]
+        tables = [self.blocks.tables[s] for s in self.seq_ids]
+        width = max(len(t) for t in tables)
+        padded = [t + [0] * (width - len(t)) for t in tables]  # padding is masked below
+        self._tables = torch.tensor(padded, device=self.device)
+        s = max(lens)
+        pos = torch.arange(s, device=self.device).expand(len(lens), s)
+        n = torch.tensor(lens, device=self.device).unsqueeze(1)
+        self._key_pos = torch.where(pos < n, pos, PAD_POSITION)
+        self._lens = lens
 
     def update(
         self, layer: int, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor
@@ -75,28 +89,20 @@ class PagedKVCache:
         """
         if len(self.seq_ids) != k.shape[0]:
             raise ValueError("bind() the batch's sequence ids before the forward pass")
-        kv, bs = self.kv[layer], self.block_size
-        gathered, lengths = [], []
-        for row, seq in enumerate(self.seq_ids):
-            n = self.blocks.lens[seq]
-            pos = positions[row]
-            if int(pos.max()) >= n:
-                raise IndexError(f"sequence {seq}: write at {int(pos.max())} but only {n} slots")
-            table = self._table(seq)
-            blk, off = table[pos // bs], pos % bs
-            # Advanced indices around a slice put the token axis first: [T, H, D].
-            kv[blk, 0, :, off] = k[row].transpose(0, 1)
-            kv[blk, 1, :, off] = v[row].transpose(0, 1)
-            blocks = kv[table]  # [nb, 2, H, bs, D]
-            flat = blocks.permute(1, 2, 0, 3, 4).reshape(2, k.shape[1], -1, k.shape[3])
-            gathered.append(flat[:, :, :n])
-            lengths.append(n)
-        s = max(lengths)
-        b, h, _, d = k.shape
-        keys = k.new_zeros(b, h, s, d)
-        values = k.new_zeros(b, h, s, d)
-        key_pos = torch.full((b, s), PAD_POSITION, dtype=torch.long, device=k.device)
-        for row, (g, n) in enumerate(zip(gathered, lengths, strict=True)):
-            keys[row, :, :n], values[row, :, :n] = g[0], g[1]
-            key_pos[row, :n] = torch.arange(n, device=k.device)
-        return keys, values, key_pos
+        if layer == 0:
+            self._prepare()
+            limit = torch.tensor(self._lens, device=positions.device)
+            if bool((positions.max(dim=1).values >= limit).any()):
+                raise IndexError("write position beyond the slots reserved for a sequence")
+        b, h, t, d = k.shape
+        bs = self.block_size
+        kv = self.kv[layer]
+        flat = kv.view(-1, 2, h, d)  # one row per token slot
+        slots = torch.gather(self._tables, 1, positions // bs) * bs + positions % bs  # [B, T]
+        new = torch.stack((k, v), dim=2).permute(0, 3, 2, 1, 4).reshape(b * t, 2, h, d)
+        flat[slots.reshape(-1)] = new
+        s = self._key_pos.shape[1]
+        gathered = kv[self._tables].reshape(b, -1, 2, h, d)[:, :s]  # [B, S, 2, H, D]
+        keys = gathered[:, :, 0].transpose(1, 2)
+        values = gathered[:, :, 1].transpose(1, 2)
+        return keys, values, self._key_pos
