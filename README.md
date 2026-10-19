@@ -13,9 +13,32 @@ An LLM inference engine written from scratch in PyTorch. It serves TinyLlama-1.1
 | M4 | Continuous batching engine with preemption | ✅ done |
 | M5 | Streaming server (OpenAI-style SSE) | ✅ done |
 | M6 | int8 weight-only quantisation | ✅ done |
-| M7 | Benchmarks vs Hugging Face on a T4 | 🟡 harness built and tested; T4 run pending |
+| M7 | Benchmarks vs Hugging Face on a T4 | ✅ done |
 | M8 | Stretch: Triton decode kernel, CUDA graphs or prefix caching | ⬜ |
 | M9 | README results and demo | ⬜ |
+
+## Results on a Tesla T4
+
+Measured on a Kaggle T4 (torch 2.11, CUDA 12.8, transformers 5.16) with `bench/run_all.sh`; raw data and the full table are in [`bench/results/`](bench/results/summary.md).
+
+**Throughput vs Hugging Face `generate()`** (fp16, same requests: 64-512-token prompts, 64-256 new tokens each, median of 3 repeats):
+
+| Concurrent requests | TinyInfer tok/s | HF static batching tok/s | TinyInfer vs HF static | TinyInfer vs HF one-at-a-time | TinyInfer TTFT p99 |
+|---|---|---|---|---|---|
+| 1 | 35.6 | 35.4 | 1.01x | 1.00x | 63 ms |
+| 4 | 119.8 | 109.4 | 1.09x | 3.38x | 205 ms |
+| 16 | 282.2 | 222.8 | **1.27x** | **7.95x** | 850 ms |
+| 32 | 319.9 | 233.8 | **1.37x** | **9.02x** | 1,699 ms |
+
+![Throughput vs concurrency](bench/results/throughput.png)
+
+The gain comes from continuous batching: a finished request is replaced at the next step, while a static batch waits for its longest request. At one request both systems decode at the same speed (39 tok/s single-stream; 37 ms to prefill 128 tokens).
+
+**int8 weights:** weight memory 2.05 → 1.09 GiB (−47.0%); full WikiText-2 test-split perplexity 8.8693 (fp16) → 8.8699 (int8, every linear layer), +0.01%. int8 decoding is slower than fp16 (0.44-0.80x) because weights are dequantised on every forward pass: it buys memory (2,867 more KV blocks), not speed.
+
+**Peak GPU memory** is ~13 GiB for TinyInfer by design: like vLLM, the engine reserves 90% of free GPU memory for KV-cache blocks at start-up.
+
+**Where the time goes, and what would improve it** (not yet done): new requests are prefilled one at a time and separately from the decode batch, so under load a request waits for earlier prefills (TTFT p99 850 ms at 16 concurrent). Each layer also copies the batch's KV blocks into a contiguous tensor before attention. Batched or chunked prefill, a paged-attention kernel that reads blocks in place, and CUDA graphs for the decode step are the next steps.
 
 ## Correctness so far
 
@@ -24,6 +47,8 @@ Our forward pass loads the real TinyLlama-1.1B-Chat safetensors and is compared 
 | Check | Result |
 |---|---|
 | Final-position logits vs Hugging Face, fp32 CPU | max abs difference **0.0** on all 5 prompts (bit-identical) |
+| Final-position logits vs Hugging Face, fp16 on a T4 | max abs difference 0.016-0.027 (largest on the 361-token prompt), identical argmax; the fp16 tolerance is 5e-2 |
+| Greedy decoding on a T4 (single, paged, batched) vs HF fp16 `generate()` on the same GPU | identical tokens on all 5 prompts |
 | Argmax token vs Hugging Face | identical on all 5 prompts |
 | Random tiny model vs Hugging Face (CI) | max abs difference < 1e-4 |
 | Sensitivity check | scaling one MLP weight by 1% moves logits by 0.016, so the test detects real differences |
@@ -59,7 +84,7 @@ Quality, WikiText-2 perplexity of our forward pass (`bench/perplexity.py`, 1,024
 | int8, lm_head full precision | 10.7030 | -0.004% |
 | int8, every linear layer | 10.7038 | +0.004% |
 
-These perplexities use the first 8 windows (8,192 predicted tokens) on CPU, so treat them as a check, not the final figure; the full 341k-token split runs on the T4 in M7. As a sanity check that quantisation is applied, the all-int8 model's logits move by 0.06 on average (max 2.6) and its top-1 prediction differs on 5% of random-token positions; on natural text the effect on perplexity is small.
+These perplexities use the first 8 windows (8,192 predicted tokens) on CPU. On the full 341k-token test split on a T4 (fp16): 8.8693 full precision, 8.8706 int8 with lm_head in fp16, 8.8699 int8 everywhere. As a sanity check that quantisation is applied, the all-int8 model's logits move by 0.06 on average (max 2.6) and its top-1 prediction differs on 5% of random-token positions; on natural text the effect on perplexity is small.
 
 ### Single-stream speed (development baseline, CPU)
 

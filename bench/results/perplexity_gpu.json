@@ -1,0 +1,25 @@
+{
+  "device": "cuda",
+  "window": 1024,
+  "dataset_tokens": 341469,
+  "full": {
+    "perplexity": 8.8693,
+    "tokens": 341468,
+    "seconds": 112.2
+  },
+  "int8": {
+    "perplexity": 8.8706,
+    "tokens": 341468,
+    "seconds": 133.1,
+    "increase_pct": 0.01,
+    "within_2pct_budget": true
+  },
+  "int8_all": {
+    "perplexity": 8.8699,
+    "tokens": 341468,
+    "seconds": 134.8,
+    "increase_pct": 0.01,
+    "within_2pct_budget": true
+  },
+  "dtype": "fp16"
+}
