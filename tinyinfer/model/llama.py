@@ -95,8 +95,7 @@ class Attention(nn.Module):
             key_pos = positions
         else:
             # Write this step's keys/values, then attend over everything stored.
-            k, v = cache.update(layer, k, v, positions)
-            key_pos = torch.arange(k.shape[2], device=x.device).unsqueeze(0).expand(b, -1)
+            k, v, key_pos = cache.update(layer, k, v, positions)
         # GQA: query head h reads KV head h // groups. repeat_interleave on the
         # head axis produces exactly that mapping.
         k = k.repeat_interleave(self.groups, dim=1)

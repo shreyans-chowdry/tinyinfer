@@ -32,8 +32,10 @@ class ContiguousKVCache:
 
     def update(
         self, layer: int, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Store k, v ([B, kv_heads, T, D]) at positions ([B, T]); return the filled prefix.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Store k, v ([B, kv_heads, T, D]) at positions ([B, T]).
+
+        Returns the filled prefix of K and V and the key positions [B, S].
 
         Positions must be contiguous and identical across the batch in M2.
         """
@@ -44,4 +46,5 @@ class ContiguousKVCache:
         self.v[layer][:, :, start:end] = v
         if layer == len(self.k) - 1:
             self.length = max(self.length, end)
-        return self.k[layer][:, :, :end], self.v[layer][:, :, :end]
+        key_pos = torch.arange(end, device=k.device).unsqueeze(0).expand(k.shape[0], -1)
+        return self.k[layer][:, :, :end], self.v[layer][:, :, :end], key_pos
