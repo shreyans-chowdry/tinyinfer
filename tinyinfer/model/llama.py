@@ -116,7 +116,8 @@ class Attention(nn.Module):
         # fold g into the query-length axis and attend once per KV head.
         q = q.reshape(b, hkv, g * t, d)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=state["mask"])
-        out = out.view(b, h, t, d).transpose(1, 2).reshape(b, t, h * d)
+        # reshape, not view: CUDA SDPA kernels may return a non-contiguous output.
+        out = out.reshape(b, h, t, d).transpose(1, 2).reshape(b, t, h * d)
         return self.o_proj(out)
 
 
