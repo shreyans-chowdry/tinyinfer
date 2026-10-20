@@ -31,4 +31,8 @@ python bench/throughput.py --model-dir "$MODEL_DIR" --repeats "$REPEATS" \
   --concurrency 1 4 16 32 --out bench/results/raw.jsonl
 
 python bench/report.py --raw bench/results/raw.jsonl --out bench/results
+if [ -f bench/results/m7_baseline/summary.json ]; then
+  python bench/compare.py bench/results/m7_baseline/summary.json bench/results/summary.json \
+    --out bench/results/comparison_vs_m7.md
+fi
 echo "done: bench/results/summary.md"

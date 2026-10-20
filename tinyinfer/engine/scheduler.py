@@ -5,7 +5,8 @@ Every step the scheduler:
      out it preempts the most recently admitted sequences (frees their blocks,
      puts them back at the front of the queue to be recomputed later);
   2. if nothing was preempted, admits WAITING sequences in FIFO order while
-     their tokens fit in free blocks and in the per-step token budget;
+     their tokens fit in free blocks and the padded prefill batch
+     (rows x longest prompt) fits in the per-step token budget;
   3. returns which sequences to prefill and which to decode this step.
 """
 
@@ -74,19 +75,22 @@ class Scheduler:
             break  # seq preempted itself; it was the last running sequence
         if out.preempted:
             return out  # memory is tight: do not admit anything this step
-        # 2. Admit waiting sequences (prefill) in FIFO order.
-        budget = self.max_num_batched_tokens - len(out.decodes)
+        # 2. Admit waiting sequences (prefill) in FIFO order. All admitted prompts run
+        #    in one padded forward pass, so the budget counts padded tokens:
+        #    rows x longest prompt.
+        width = 0
         while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
             n = len(seq.all_ids)
-            if n > budget or not self.blocks.can_allocate(n + 1):
+            cost = (len(out.prefills) + 1) * max(width, n)
+            if cost > self.max_num_batched_tokens or not self.blocks.can_allocate(n + 1):
                 break
             self.waiting.popleft()
             self.blocks.allocate(seq.seq_id, n)
             seq.status = Status.RUNNING
             self.running.append(seq)
             out.prefills.append(seq)
-            budget -= n
+            width = max(width, n)
         return out
 
     def finish(self, seq: Sequence, reason: str) -> None:

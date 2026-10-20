@@ -1,7 +1,9 @@
 """Load HF Llama safetensors checkpoints into our modules.
 
 HF names look like model.layers.3.self_attn.q_proj.weight; ours drop the
-"model." prefix. Every checkpoint tensor must be used exactly once and every
+"model." prefix. HF stores q/k/v and gate/up as separate matrices; we
+concatenate them into qkv_proj and gate_up_proj (one matmul instead of three
+or two). Every checkpoint tensor must be used exactly once and every
 parameter must be filled, so a silent mismatch cannot load half a model.
 """
 
@@ -18,11 +20,39 @@ from .llama import Llama
 
 def hf_to_ours(name: str) -> str:
     """Map a HF Llama tensor name to this engine's parameter name."""
-    return name[len("model."):] if name.startswith("model.") else name
+    return name.removeprefix("model.")
+
+
+FUSED = {
+    "self_attn.qkv_proj": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+    "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
+}
+
+
+def fuse_projections(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Concatenate per-layer q/k/v and gate/up weights along the output axis.
+
+    A layer must provide all parts of a fused group or none of them.
+    """
+    out = dict(tensors)
+    prefixes = {n.rsplit(".self_attn.", 1)[0] for n in tensors if ".self_attn." in n}
+    prefixes |= {n.rsplit(".mlp.", 1)[0] for n in tensors if ".mlp." in n}
+    for prefix in sorted(prefixes):
+        for fused, parts in FUSED.items():
+            names = [f"{prefix}.{part}.weight" for part in parts]
+            present = [n in out for n in names]
+            if not any(present):
+                continue
+            if not all(present):
+                missing = [n for n, ok in zip(names, present, strict=True) if not ok]
+                raise KeyError(f"parameters not in checkpoint: {missing}")
+            out[f"{prefix}.{fused}.weight"] = torch.cat([out.pop(n) for n in names], dim=0)
+    return out
 
 
 def load_state(model: Llama, tensors: dict[str, torch.Tensor]) -> None:
     """Copy tensors into model, checking names, shapes and full coverage."""
+    tensors = fuse_projections(tensors)
     params = dict(model.named_parameters())
     used: set[str] = set()
     for hf_name, tensor in tensors.items():

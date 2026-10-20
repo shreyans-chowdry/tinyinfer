@@ -58,12 +58,18 @@ class PagedKVCache:
         ]
         self.device = torch.device(device)
         self.seq_ids: list[int] = []
+        self.has_padding = False
         self._tables: torch.Tensor | None = None
         self._key_pos: torch.Tensor | None = None
 
-    def bind(self, seq_ids: list[int]) -> None:
-        """Set which sequence each batch row belongs to for the next forward pass."""
+    def bind(self, seq_ids: list[int], has_padding: bool = False) -> None:
+        """Set which sequence each batch row belongs to for the next forward pass.
+
+        has_padding: some rows contain padding tokens (position -1) that must
+        not be written to the cache (batched prefill of unequal prompts).
+        """
         self.seq_ids = list(seq_ids)
+        self.has_padding = has_padding
 
     def _prepare(self) -> None:
         """Build the padded block table and key positions for the bound batch."""
@@ -81,7 +87,9 @@ class PagedKVCache:
     def update(
         self, layer: int, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Write k, v ([B, kv_heads, T, D]) at positions [B, T]; return padded K, V, key positions.
+        """Write k, v ([B, kv_heads, T, D]) at positions [B, T] (-1 = padding, not written).
+
+        Returns padded K, V and key positions.
 
         Returned K, V are [B, kv_heads, S, D] with S the longest sequence in the
         batch; key positions [B, S] are PAD_POSITION past each row's length so
@@ -98,9 +106,14 @@ class PagedKVCache:
         bs = self.block_size
         kv = self.kv[layer]
         flat = kv.view(-1, 2, h, d)  # one row per token slot
-        slots = torch.gather(self._tables, 1, positions // bs) * bs + positions % bs  # [B, T]
+        pos = positions.clamp(min=0)
+        slots = torch.gather(self._tables, 1, pos // bs) * bs + pos % bs  # [B, T]
         new = torch.stack((k, v), dim=2).permute(0, 3, 2, 1, 4).reshape(b * t, 2, h, d)
-        flat[slots.reshape(-1)] = new
+        if self.has_padding:  # padding tokens would overwrite position 0: skip them
+            keep = (positions >= 0).reshape(-1)
+            flat[slots.reshape(-1)[keep]] = new[keep]
+        else:
+            flat[slots.reshape(-1)] = new
         s = self._key_pos.shape[1]
         gathered = kv[self._tables].reshape(b, -1, 2, h, d)[:, :s]  # [B, S, 2, H, D]
         keys = gathered[:, :, 0].transpose(1, 2)

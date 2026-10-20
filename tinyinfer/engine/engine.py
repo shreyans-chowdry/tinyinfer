@@ -105,21 +105,23 @@ class LLMEngine:
             self.scheduler.finish(seq, "length")
         events.append(StepEvent(seq.seq_id, token, done))
 
+    def _accept_batch(self, seqs: list[Sequence], logits: torch.Tensor, events: list) -> None:
+        # Greedy rows: one argmax and one device-to-host copy for the whole batch.
+        greedy = logits.argmax(-1).tolist()
+        for row, seq in enumerate(seqs):
+            if seq.params.temperature == 0:
+                self._accept(seq, None, events, token=greedy[row])
+            else:
+                self._accept(seq, logits[row], events)
+
     def step(self) -> list[StepEvent]:
-        """Run one scheduler iteration: prefill admitted sequences, decode the rest."""
+        """Run one scheduler iteration: one batched prefill, then one batched decode."""
         plan = self.scheduler.schedule()
         events: list[StepEvent] = []
-        for seq in plan.prefills:
-            self._accept(seq, self.runner.prefill(seq), events)
+        if plan.prefills:
+            self._accept_batch(plan.prefills, self.runner.prefill(plan.prefills), events)
         if plan.decodes:
-            logits = self.runner.decode(plan.decodes)
-            # Greedy rows: one argmax and one device-to-host copy for the whole batch.
-            greedy = logits.argmax(-1).tolist()
-            for row, seq in enumerate(plan.decodes):
-                if seq.params.temperature == 0:
-                    self._accept(seq, None, events, token=greedy[row])
-                else:
-                    self._accept(seq, logits[row], events)
+            self._accept_batch(plan.decodes, self.runner.decode(plan.decodes), events)
         return events
 
     def generate_many(
@@ -162,7 +164,8 @@ class LLMEngine:
         try:
             ids = torch.tensor([prompt_ids], device=self.device)
             positions = torch.arange(n, device=self.device).unsqueeze(0)
-            logits = self.model(ids, positions, cache)[0, -1]  # prefill
+            last = torch.tensor([n - 1], device=self.device)
+            logits = self.model(ids, positions, cache, last)[0, -1]  # prefill
             for step in range(params.max_tokens):
                 token = sample(logits, params, gen)
                 if token in stops:

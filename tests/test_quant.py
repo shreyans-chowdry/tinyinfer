@@ -36,7 +36,7 @@ def test_quantize_model_replaces_all_linears_except_lm_head():
     linears = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
     int8 = [n for n, m in model.named_modules() if isinstance(m, Int8Linear)]
     assert linears == ["lm_head"]
-    assert len(int8) == tiny_config().num_hidden_layers * 7  # q,k,v,o,gate,up,down
+    assert len(int8) == tiny_config().num_hidden_layers * 4  # qkv, o, gate_up, down
 
 
 def test_weight_memory_drops_and_logits_stay_close():

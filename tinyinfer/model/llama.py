@@ -57,14 +57,20 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate q or k ([B, H, T, D]) by position-dependent angles."""
-    cos = cos.unsqueeze(1).to(x.dtype)  # [B, 1, T, D]
-    sin = sin.unsqueeze(1).to(x.dtype)
+    """Rotate q/k heads laid out as [B, T, heads, D] by position-dependent angles."""
+    cos = cos.unsqueeze(2).to(x.dtype)  # [B, T, 1, D]
+    sin = sin.unsqueeze(2).to(x.dtype)
     return x * cos + rotate_half(x) * sin
 
 
 class Attention(nn.Module):
-    """Causal self-attention with grouped-query attention (GQA)."""
+    """Causal self-attention with grouped-query attention (GQA).
+
+    Q, K and V come from one fused projection, and RoPE is applied to the query
+    and key heads in a single call. K/V are never copied per query head: the
+    query heads that share a KV head are folded into the query-length axis, so
+    attention reads each KV head once.
+    """
 
     def __init__(self, cfg: LlamaConfig) -> None:
         super().__init__()
@@ -72,9 +78,8 @@ class Attention(nn.Module):
         self.n_kv = cfg.num_key_value_heads
         self.groups = cfg.num_kv_groups
         self.head_dim = cfg.head_dim
-        self.q_proj = nn.Linear(cfg.hidden_size, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.n_kv * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv * self.head_dim, bias=False)
+        qkv_heads = self.n_heads + 2 * self.n_kv
+        self.qkv_proj = nn.Linear(cfg.hidden_size, qkv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)
 
     def forward(
@@ -85,38 +90,47 @@ class Attention(nn.Module):
         positions: torch.Tensor,
         cache=None,
         layer: int = 0,
+        state: dict | None = None,
     ) -> torch.Tensor:
         b, t, _ = x.shape
-        q = self.q_proj(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, t, self.n_kv, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, t, self.n_kv, self.head_dim).transpose(1, 2)
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        h, hkv, g, d = self.n_heads, self.n_kv, self.groups, self.head_dim
+        qkv = self.qkv_proj(x).view(b, t, h + 2 * hkv, d)
+        qk = apply_rope(qkv[:, :, : h + hkv], cos, sin)  # query and key heads together
+        q = qk[:, :, :h].transpose(1, 2)  # [B, H, T, D]
+        k = qk[:, :, h:].transpose(1, 2)  # [B, Hkv, T, D]
+        v = qkv[:, :, h + hkv :].transpose(1, 2)
         if cache is None:
             key_pos = positions
         else:
             # Write this step's keys/values, then attend over everything stored.
             k, v, key_pos = cache.update(layer, k, v, positions)
-        # GQA: query head h reads KV head h // groups. repeat_interleave on the
-        # head axis produces exactly that mapping.
-        k = k.repeat_interleave(self.groups, dim=1)
-        v = v.repeat_interleave(self.groups, dim=1)
-        # Causal mask from explicit positions: a query sees keys at or before it.
-        mask = key_pos.unsqueeze(1) <= positions.unsqueeze(2)  # [B, T, S]
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1))
-        return self.o_proj(out.transpose(1, 2).reshape(b, t, -1))
+        state = {} if state is None else state
+        if "mask" not in state:
+            # Causal mask from explicit positions: a query sees keys at or before it.
+            # Padding queries (position -1) see key 0, so no row is fully masked.
+            mask = key_pos.unsqueeze(1) <= positions.clamp(min=0).unsqueeze(2)  # [B, T, S]
+            s = mask.shape[-1]
+            # One copy per query head in a group, matching the folded query layout.
+            state["mask"] = mask.unsqueeze(1).expand(b, g, t, s).reshape(b, 1, g * t, s)
+        # Query head i uses KV head i // g, so [B, H, T, D] = [B, Hkv, g, T, D]:
+        # fold g into the query-length axis and attend once per KV head.
+        q = q.reshape(b, hkv, g * t, d)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=state["mask"])
+        out = out.view(b, h, t, d).transpose(1, 2).reshape(b, t, h * d)
+        return self.o_proj(out)
 
 
 class MLP(nn.Module):
-    """SwiGLU feed-forward: down(silu(gate(x)) * up(x))."""
+    """SwiGLU feed-forward: down(silu(gate(x)) * up(x)), gate and up fused into one matmul."""
 
     def __init__(self, cfg: LlamaConfig) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(cfg.hidden_size, 2 * cfg.intermediate_size, bias=False)
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class DecoderLayer(nn.Module):
@@ -129,8 +143,9 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x, cos, sin, positions, cache=None, layer: int = 0) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, positions, cache, layer)
+    def forward(self, x, cos, sin, positions, cache=None, layer: int = 0, state=None):
+        attn = self.self_attn(self.input_layernorm(x), cos, sin, positions, cache, layer, state)
+        x = x + attn
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -149,19 +164,31 @@ class Llama(nn.Module):
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_position_embeddings, cfg.rope_theta)
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor | None = None, cache=None
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        cache=None,
+        logits_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return logits [B, T, vocab] for input_ids [B, T].
 
         positions defaults to 0..T-1; pass it explicitly when tokens do not
-        start at position 0. With a cache, keys/values are written at those
-        positions and attention covers everything stored so far.
+        start at position 0. Position -1 marks a padding token: it is neither
+        written to the cache nor attended to. With a cache, keys/values are
+        written at the given positions and attention covers everything stored.
+
+        logits_index ([B] token indices) computes the LM head only at those
+        positions and returns [B, 1, vocab]; prefill needs just the last token.
         """
         if positions is None:
             positions = torch.arange(input_ids.shape[1], device=input_ids.device)
             positions = positions.unsqueeze(0).expand(input_ids.shape[0], -1)
-        cos, sin = self.rope(positions)
+        cos, sin = self.rope(positions.clamp(min=0))
         x = self.embed_tokens(input_ids)
+        state: dict = {}  # per-forward values shared by all layers (the attention mask)
         for i, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, positions, cache, i)
+            x = layer(x, cos, sin, positions, cache, i, state)
+        if logits_index is not None:
+            rows = torch.arange(x.shape[0], device=x.device)
+            x = x[rows, logits_index].unsqueeze(1)
         return self.lm_head(self.norm(x))

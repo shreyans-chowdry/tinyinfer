@@ -1,6 +1,7 @@
 """M7 tests: the benchmark harness runs end to end on tiny models (CPU)."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -92,11 +93,13 @@ def test_full_pipeline_runs_and_writes_report(tiny_hf_dir, tmp_path):
            "--device", "cpu", "--concurrency", "1", "2", "--repeats", "1",
            "--min-requests", "4", "--prompt-len", "4", "12", "--gen-len", "2", "5",
            "--num-blocks", "64", "--out", str(raw)]
-    subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True, timeout=300)
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}  # works without `pip install -e .`
+    subprocess.run(cmd, cwd=ROOT, env=env, check=True, capture_output=True, timeout=300)
     rows = [json.loads(line) for line in raw.read_text().splitlines()]
     systems = {(r["system"], r["concurrency"]) for r in rows}
     assert ("tinyinfer", 2) in systems and ("tinyinfer-int8", 1) in systems
     assert ("hf-static", 2) in systems and ("hf-sequential", 1) in systems
     subprocess.run([sys.executable, "bench/report.py", "--raw", str(raw), "--out", str(tmp_path),
-                    "--no-plots"], cwd=ROOT, check=True, capture_output=True, timeout=120)
+                    "--no-plots"], cwd=ROOT, env=env, check=True, capture_output=True,
+                   timeout=120)
     assert "| tinyinfer | 2 |" in (tmp_path / "summary.md").read_text()

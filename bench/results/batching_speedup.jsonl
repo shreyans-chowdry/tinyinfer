@@ -1,1 +1,2 @@
 {"device": "cpu (Intel Xeon 2.8 GHz, 2 vCPU, fp32)", "requests": 8, "sequential_tok_s": 2.43, "batched_tok_s": 5.63, "speedup": 2.31, "identical_outputs": true}
+{"device": "cpu (Intel Xeon 2.8 GHz, 2 vCPU, fp32)", "requests": 8, "sequential_tok_s": 4.46, "batched_tok_s": 10.93, "speedup": 2.45, "identical_outputs": true, "code": "M8"}
