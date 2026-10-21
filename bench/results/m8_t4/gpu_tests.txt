@@ -1,0 +1,1 @@
+pytest -m 'real or gpu' on the T4: 4 passed, 63 deselected in 48.17s (fp16 logits vs HF, greedy single/paged/batched vs HF generate)

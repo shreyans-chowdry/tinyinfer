@@ -14,32 +14,44 @@ An LLM inference engine written from scratch in PyTorch. It serves TinyLlama-1.1
 | M5 | Streaming server (OpenAI-style SSE) | ✅ done |
 | M6 | int8 weight-only quantisation | ✅ done |
 | M7 | Benchmarks vs Hugging Face on a T4 | ✅ done |
-| M8 | Speed-ups: copy-free GQA, batched prefill, fused projections, last-token LM head | 🟡 built and tested; T4 re-run pending |
+| M8 | Speed-ups: copy-free GQA, batched prefill, fused projections, last-token LM head | ✅ done (2.36x M7 at 32 requests) |
 | M9 | Stretch: paged-attention kernel, CUDA graphs, prefix caching | ⬜ |
 | M10 | README results and demo | ⬜ |
 
 ## Results on a Tesla T4
 
-Measured on a Kaggle T4 (torch 2.11, CUDA 12.8, transformers 5.16) with `bench/run_all.sh`; raw data and the full table are in [`bench/results/m7_baseline/`](bench/results/m7_baseline/summary.md).
+Measured on a Kaggle T4 (torch 2.11, CUDA 12.8, transformers 5.16) with `bench/run_all.sh`. Current numbers (M8 code) are in [`bench/results/m8_t4/`](bench/results/m8_t4/summary.md); the M7 baseline is kept in [`bench/results/m7_baseline/`](bench/results/m7_baseline/summary.md).
 
 **Throughput vs Hugging Face `generate()`** (fp16, same requests: 64-512-token prompts, 64-256 new tokens each, median of 3 repeats):
 
-| Concurrent requests | TinyInfer tok/s | HF static batching tok/s | TinyInfer vs HF static | TinyInfer vs HF one-at-a-time | TinyInfer TTFT p99 |
+| Concurrent requests | TinyInfer tok/s | HF static batching tok/s | TinyInfer vs HF static | TinyInfer vs HF one-at-a-time | TinyInfer TTFT p99 | TinyInfer TPOT p50 |
+|---|---|---|---|---|---|---|
+| 1 | 40.6 | 35.9 | 1.13x | 1.13x | 60 ms | 24.5 ms |
+| 4 | 138.3 | 110.1 | 1.26x | 3.86x | 274 ms | 25.7 ms |
+| 16 | 455.1 | 221.8 | **2.05x** | **12.7x** | 990 ms | 29.1 ms |
+| 32 | 754.4 | 234.0 | **3.22x** | **21.0x** | 1,959 ms | 35.0 ms |
+
+**M8 vs M7** (same GPU, same protocol, [`comparison_vs_m7.md`](bench/results/m8_t4/comparison_vs_m7.md)):
+
+| Concurrent requests | M7 tok/s | M8 tok/s | Speed-up | M7 TPOT p50 | M8 TPOT p50 |
 |---|---|---|---|---|---|
-| 1 | 35.6 | 35.4 | 1.01x | 1.00x | 63 ms |
-| 4 | 119.8 | 109.4 | 1.09x | 3.38x | 205 ms |
-| 16 | 282.2 | 222.8 | **1.27x** | **7.95x** | 850 ms |
-| 32 | 319.9 | 233.8 | **1.37x** | **9.02x** | 1,699 ms |
+| 1 | 35.6 | 40.6 | 1.14x | 28.0 ms | 24.5 ms |
+| 16 | 282.2 | 455.1 | 1.61x | 51.5 ms | 29.1 ms |
+| 32 | 319.9 | 754.4 | **2.36x** | 94.2 ms | 35.0 ms |
 
-![Throughput vs concurrency](bench/results/m7_baseline/throughput.png)
+Per-token decode time at 32 requests fell from 94 ms to 35 ms: in M7 every layer copied each KV head 8 times for grouped-query attention, and that copy grew with the batch. Time to first token got worse under load (p99 1.70 s → 1.96 s at 32 requests): a batched prefill now waits for the longest prompt in the batch, and decode steps pause while it runs. Chunked prefill (mixing prompt chunks into decode steps) is the fix, and the next milestone.
 
-The gain comes from continuous batching: a finished request is replaced at the next step, while a static batch waits for its longest request. At one request both systems decode at the same speed (39 tok/s single-stream; 37 ms to prefill 128 tokens).
+The M7 plot (M8's plots are in the Kaggle output zip):
 
-**int8 weights:** weight memory 2.05 → 1.09 GiB (−47.0%); full WikiText-2 test-split perplexity 8.8693 (fp16) → 8.8699 (int8, every linear layer), +0.01%. int8 decoding is slower than fp16 (0.44-0.80x) because weights are dequantised on every forward pass: it buys memory (2,867 more KV blocks), not speed.
+![Throughput vs concurrency (M7)](bench/results/m7_baseline/throughput.png)
+
+The gain over static batching comes from continuous batching: a finished request is replaced at the next step, while a static batch waits for its longest request. Single-stream on the T4: 47.6 tok/s decode and 29 ms to prefill 128 tokens with M8 (39.3 tok/s and 37 ms in M7).
+
+**int8 weights:** weight memory 2.05 → 1.09 GiB (−47.0%); full WikiText-2 test-split perplexity 8.8693 (fp16) → 8.8699 (int8, every linear layer), +0.01%. int8 decoding is slower than fp16 (0.38-0.39x of TinyInfer fp16 with M8) because weights are dequantised on every forward pass: it buys memory (2,867 more KV blocks), not speed.
 
 **Peak GPU memory** is ~13 GiB for TinyInfer by design: like vLLM, the engine reserves 90% of free GPU memory for KV-cache blocks at start-up.
 
-**Where the time went in M7, and what M8 changes:** new requests were prefilled one at a time and separately from the decode batch, so under load a request waited for earlier prefills (TTFT p99 850 ms at 16 concurrent), and each layer copied every KV head 8 times for grouped-query attention. M8 batches prefill, removes the KV copies, fuses Q/K/V and gate/up into single matmuls, applies RoPE once per layer and builds the attention mask once per forward pass. M8's T4 results are added below once measured. Still not done: a paged-attention kernel that reads blocks in place, chunked prefill and CUDA graphs.
+**What M8 changed:** prompts admitted in a step are prefilled in one batched forward pass; grouped-query attention reads each KV head once instead of copying it 8 times; Q/K/V and gate/up are fused into single matmuls; RoPE is applied once per layer; the attention mask is built once per forward pass; the LM head runs only on the last token of each prompt. Still not done: chunked prefill, a paged-attention kernel that reads blocks in place, and CUDA graphs.
 
 ## Correctness so far
 
@@ -48,7 +60,7 @@ Our forward pass loads the real TinyLlama-1.1B-Chat safetensors and is compared 
 | Check | Result |
 |---|---|
 | Final-position logits vs Hugging Face, fp32 CPU | max abs difference ≤ 1.2e-5 (0.0 on 4 of 5 prompts; 1.1e-5 on the 361-token prompt), identical argmax. Before M8 it was 0.0 on all 5; the folded-GQA attention sums in a different order |
-| Final-position logits vs Hugging Face, fp16 on a T4 | max abs difference 0.016-0.027 (largest on the 361-token prompt), identical argmax; the fp16 tolerance is 5e-2 |
+| Final-position logits vs Hugging Face, fp16 on a T4 | max abs difference 0.016-0.027 (largest on the 361-token prompt), identical argmax; the fp16 tolerance is 5e-2. Re-checked with the M8 code: all 4 GPU tests pass |
 | Greedy decoding on a T4 (single, paged, batched) vs HF fp16 `generate()` on the same GPU | identical tokens on all 5 prompts |
 | Argmax token vs Hugging Face | identical on all 5 prompts |
 | Random tiny model vs Hugging Face (CI) | max abs difference < 1e-4 |

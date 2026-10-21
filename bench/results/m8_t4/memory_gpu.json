@@ -1,0 +1,4 @@
+{"device": "cuda", "kv_block_bytes_fp16": 360448, "rows": {
+  "fp16": {"weight_bytes": 2200096768, "weight_gib": 2.049, "reduction_pct": 0.0, "extra_kv_blocks_vs_fp16": 0},
+  "int8 (lm_head fp16)": {"weight_bytes": 1232001024, "weight_gib": 1.147, "reduction_pct": 44.0, "extra_kv_blocks_vs_fp16": 2685, "extra_kv_tokens_vs_fp16": 42960},
+  "int8 (all linears)": {"weight_bytes": 1166529024, "weight_gib": 1.086, "reduction_pct": 47.0, "extra_kv_blocks_vs_fp16": 2867, "extra_kv_tokens_vs_fp16": 45872}}}
